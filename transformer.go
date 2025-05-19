@@ -10,7 +10,6 @@ import (
 // PositionalEncoding builds sinusoidal positional encodings.
 func PositionalEncoding(maxLen, dModel int) (*tensor.Dense, error) {
     pe := tensor.New(tensor.WithShape(maxLen, dModel), tensor.WithBacking(make([]float32, maxLen*dModel)))
-
     for pos := 0; pos < maxLen; pos++ {
         for i := 0; i < dModel; i++ {
             angle := float32(pos) / float32(math.Pow(10000, float64(2*(i/2))/float64(dModel)))
@@ -22,6 +21,53 @@ func PositionalEncoding(maxLen, dModel int) (*tensor.Dense, error) {
         }
     }
     return pe, nil
+}
+
+// LayerNorm applies layer normalization over the last dimension of x.
+func LayerNorm(x *gorgonia.Node, epsilon float64) (*gorgonia.Node, error) {
+    // Compute mean over last axis
+    mean, err := gorgonia.Mean(x, -1)
+    if err != nil {
+        return nil, err
+    }
+    // Broadcast mean to x's shape
+    meanB, err := gorgonia.Broadcast(mean, x.Shape(), nil, []byte{byte(len(x.Shape()) - 1)})
+    if err != nil {
+        return nil, err
+    }
+    // Center x
+    centered, err := gorgonia.Sub(x, meanB)
+    if err != nil {
+        return nil, err
+    }
+    // Compute variance
+    sq, err := gorgonia.Square(centered)
+    if err != nil {
+        return nil, err
+    }
+    variance, err := gorgonia.Mean(sq, -1)
+    if err != nil {
+        return nil, err
+    }
+    // Broadcast variance
+    varB, err := gorgonia.Broadcast(variance, x.Shape(), nil, []byte{byte(len(x.Shape()) - 1)})
+    if err != nil {
+        return nil, err
+    }
+    // Normalize
+    std, err := gorgonia.Sqrt(varB)
+    if err != nil {
+        return nil, err
+    }
+    denom, err := gorgonia.AddScalar(std, epsilon, true)
+    if err != nil {
+        return nil, err
+    }
+    normed, err := gorgonia.HadamardDiv(centered, denom)
+    if err != nil {
+        return nil, err
+    }
+    return normed, nil
 }
 
 // MultiHeadAttention represents the multi-head attention mechanism.
@@ -49,22 +95,17 @@ func NewMultiHeadAttention(g *gorgonia.ExprGraph, heads, dModel int) *MultiHeadA
 
 // Forward applies multi-head attention to inputs Q, K, V.
 func (mha *MultiHeadAttention) Forward(q, k, v *gorgonia.Node) (*gorgonia.Node, error) {
-    // Linear projections
     Q, _ := gorgonia.Mul(q, mha.wQ)
-    K, _ := gorgonia.Mul(k, mha.wK)
-    V, _ := gorgonia.Mul(v, mha.wV)
+    K_, _ := gorgonia.Mul(k, mha.wK)
+    V_, _ := gorgonia.Mul(v, mha.wV)
 
-    // TODO: reshape Q, K, V to (batch, heads, seqLen, dHead)
-    // Compute scaled dot-product attention per head.
-    scores, _ := gorgonia.Mul(Q, gorgonia.Must(gorgonia.Transpose(K)))
+    scores, _ := gorgonia.Mul(Q, gorgonia.Must(gorgonia.Transpose(K_)))
     scale := 1.0 / float32(math.Sqrt(float64(mha.dHead)))
     scoresScaled, _ := gorgonia.Mul(scores, gorgonia.NewConstant(scale))
 
     attnWeights, _ := gorgonia.SoftMax(scoresScaled)
-    context, _ := gorgonia.Mul(attnWeights, V)
+    context, _ := gorgonia.Mul(attnWeights, V_)
 
-    // TODO: concat heads back to (batch, seqLen, dModel)
-    // Final linear
     out, err := gorgonia.Mul(context, mha.wO)
     if err != nil {
         return nil, err
@@ -104,18 +145,15 @@ func (ff *FeedForward) Forward(x *gorgonia.Node) (*gorgonia.Node, error) {
 
 // TransformerBlock encapsulates one encoder block.
 type TransformerBlock struct {
-    mha       *MultiHeadAttention
-    ff        *FeedForward
-    norm1, norm2 *gorgonia.Node
+    mha *MultiHeadAttention
+    ff  *FeedForward
 }
 
 // NewTransformerBlock builds one encoder layer.
 func NewTransformerBlock(g *gorgonia.ExprGraph, heads, dModel, dFF int) *TransformerBlock {
     return &TransformerBlock{
-        mha:  NewMultiHeadAttention(g, heads, dModel),
-        ff:   NewFeedForward(g, dModel, dFF),
-        norm1: gorgonia.NewVector(g, tensor.Float32, gorgonia.WithShape(dModel), gorgonia.WithName("Norm1")),
-        norm2: gorgonia.NewVector(g, tensor.Float32, gorgonia.WithShape(dModel), gorgonia.WithName("Norm2")),
+        mha: NewMultiHeadAttention(g, heads, dModel),
+        ff:  NewFeedForward(g, dModel, dFF),
     }
 }
 
@@ -125,16 +163,21 @@ func (tb *TransformerBlock) Forward(x *gorgonia.Node) (*gorgonia.Node, error) {
     if err != nil {
         return nil, err
     }
-    // Residual + Norm (LayerNorm implemented as simple normalization here)
     res1, _ := gorgonia.Add(x, attnOut)
-    normed1, _ := gorgonia.LayerNorm(res1, tb.norm1, 1e-6)
+    normed1, err := LayerNorm(res1, 1e-6)
+    if err != nil {
+        return nil, err
+    }
 
     ffOut, err := tb.ff.Forward(normed1)
     if err != nil {
         return nil, err
     }
     res2, _ := gorgonia.Add(normed1, ffOut)
-    normed2, _ := gorgonia.LayerNorm(res2, tb.norm2, 1e-6)
+    normed2, err := LayerNorm(res2, 1e-6)
+    if err != nil {
+        return nil, err
+    }
 
     return normed2, nil
 }
@@ -155,4 +198,3 @@ func Example() {
     }
     fmt.Println("Output node:", out)
 }
-
